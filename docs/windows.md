@@ -335,8 +335,18 @@ The DLL exports the full `extern "C"` surface (including the #111 pipeline ABI);
 `ColiCudaTensor*` is opaque to the host (stored, never dereferenced), so the
 MSVC-allocated struct is safe across the ABI boundary. `CUDA_ARCH` must match
 your GPU's compute capability (e.g. `sm_120` for Blackwell / RTX 50-series,
-`sm_89` for Ada / RTX 40-series). A one-shot `build_cuda.bat` wrapper is also
-available.
+`sm_89` for Ada / RTX 40-series). A one-shot `build_cuda.bat` wrapper (the DLL
+alone) and `build_engine.bat` (the DLL and the host engine that loads it, the
+path `coli setup` uses) are also available.
+
+`coli setup` does that itself on Windows: with a compiler and the CUDA Toolkit
+here it builds the CUDA backend for the card in this machine (the toolkit has to
+build for that card — CUDA 13 cannot build for a 6.1 one, and the setup says so
+instead of trying). `build_engine.bat` detects the card's compute capability and
+builds with that arch (`sm_75` on a GTX 1650), which puts the PTX of that arch
+in the DLL beside its SASS, so the driver JITs it on the newer cards. The
+release's own `coli_cuda.dll` is portable — compute 8.0 and newer — so it is
+what runs with `--engine prebuilt`, and a card below 8.0 stays on Vulkan there.
 
 **Measured on a single RTX 5070 Ti + Core Ultra 9 (32 GB RAM):** CPU-only 0.63
 → CUDA attention+dense 0.72 → **1.07 tok/s** with the GPU-resident pipeline at

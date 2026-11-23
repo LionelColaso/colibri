@@ -324,7 +324,13 @@ def toolchain(here=None):
           "glslc": shutil.which("glslc"), "vulkan_headers": False, "nvcc": _nvcc(),
           "msys2": None, "npm": shutil.which("npm")}
     if sys.platform == "win32":
-        tc["nvcc"] = None   # the Windows CUDA path is a separate MSVC build (docs/windows.md)
+        # The Windows CUDA path is a separate MSVC build (docs/windows.md), but
+        # nvcc is what builds the DLL: the Makefile runs plain `nvcc` from PATH
+        # (CUDA_PATH has spaces, which its unquoted recipes cannot survive), so
+        # the PATH is what counts here. With it, the toolkit's own answer about
+        # the cards it builds for (cuda_toolkit, toolkit_builds) is known here
+        # too, as on Linux.
+        tc["nvcc"] = shutil.which("nvcc")
         path_vulkan = False
         if tc["cc"]:
             prefix = os.path.dirname(os.path.dirname(tc["cc"]))
@@ -593,24 +599,32 @@ def choose_backend(hw, family, tc, requested="auto", exclude=()):
     blocked = None
     if nvidia and requested in ("auto", "cuda") and "cuda" not in exclude:
         here = win_cuda and prebuilt_runs(family, "cuda")
-        if here or (win_cuda and release_cuda(family, tc)):
+        # Where the Windows CUDA backend comes from: a DLL beside the engine
+        # (built here), a build made here (the sources), or the release's
+        # portable one.
+        source = "here" if here else ("build" if tc.get("can_build") else "release")
+        # A CUDA build can be made here: Linux builds the engine's CUDA objects
+        # into it, Windows builds the DLL and the host that loads it (the bat
+        # sets up MSVC itself).
+        buildable = (cuda_engine and tc.get("can_build_cuda")) or \
+                    (win_cuda and tc.get("can_build") and tc.get("nvcc"))
+        if win_cuda and source in ("here", "release") and \
+                (source == "here" or release_cuda(family, tc)):
             card = nvidia[0]
             sm = setup_hw.compute_cap_sm(card.get("compute_cap"))
-            if requested == "cuda" or (sm is not None and sm >= WINDOWS_CUDA_FLOOR):
+            # A DLL built here runs on the card it was built for (local_cuda_arch);
+            # the release's is portable (WINDOWS_CUDA_FLOOR).
+            arch = local_cuda_arch() if source == "here" else None
+            if requested == "cuda" or cuda_dll_runs(sm, arch):
                 detail = f" (compute {card['compute_cap']})" if card.get("compute_cap") else ""
-                where = "coli_cuda.dll beside the engine" if here else \
+                where = "coli_cuda.dll beside the engine" if source == "here" else \
                     f"the release's CUDA backend ({RELEASE_CUDA_WIN32})"
                 decision.update(backend="cuda", gpu=card["name"],
                                 reason=f"{nvidia_name(card)}{detail} with {where}")
                 return decision
-            dll = "the coli_cuda.dll here" if here else "the release's coli_cuda.dll"
-            blocked = {"why": f"{dll} runs on compute {WINDOWS_CUDA_FLOOR / 10:.1f} and "
-                              f"newer, and the {card['name']} is "
-                              + (f"compute {card['compute_cap']}" if sm is not None else "of unknown compute"),
-                       "fix": ""}
-        elif win_cuda and not release_cuda_lacks(family.id, current_version()):
-            decision["missing"].append(("cuda", TEXT_HINTS["cuda-win32-release"]))
-        elif cuda_engine and tc.get("can_build_cuda"):
+            dll = "the coli_cuda.dll here" if source == "here" else "the release's coli_cuda.dll"
+            blocked = {"why": cuda_dll_why(dll, arch, card, sm), "fix": ""}
+        elif buildable and (source == "build" or cuda_engine):
             blocked = cuda_problem(nvidia, family, tc)
             if blocked is None:
                 card = nvidia[0]
@@ -621,12 +635,19 @@ def choose_backend(hw, family, tc, requested="auto", exclude=()):
                                 make_args=cuda_make_args(family, tc, nvidia))
                 return decision
             if requested == "cuda":
-                instead = choose_backend(hw, family, tc, "auto", exclude=tuple(exclude) + ("cuda",))
+                instead = choose_backend(hw, family, tc, "auto",
+                                         exclude=tuple(exclude) + ("cuda",))
                 raise SetupError(f"{blocked['why']}: "
                                  + (f"{blocked['fix']} for the CUDA path, or " if blocked["fix"] else "")
                                  + f"run with --backend auto to use {USING[instead['backend']]}")
             if blocked["fix"]:
                 decision["missing"].append(("cuda", f"{blocked['fix']} ({CUDA_ARCHIVE_URL})"))
+        elif win_cuda and tc.get("can_build"):
+            # A compiler here, but no CUDA toolkit: the Windows CUDA build needs
+            # both (the DLL is nvcc's, the host that loads it MSVC's).
+            decision["missing"].append(("cuda", _gpu_hint(["cuda"], hw, tc)))
+        elif win_cuda and not release_cuda_lacks(family.id, current_version()):
+            decision["missing"].append(("cuda", TEXT_HINTS["cuda-win32-release"]))
         elif cuda_engine:
             needs = ["cuda"] if tc.get("can_build") else ["build", "cuda"]
             decision["missing"].append(("cuda", _gpu_hint(needs, hw, tc)))
@@ -763,6 +784,61 @@ def prebuilt_runs(family, backend, directory=None):
     return True
 
 
+def local_cuda_arch(directory=None):
+    """The arch a CUDA DLL built here was built for: build_engine.bat leaves the
+    marker beside it, naming the arch ("sm_89" -> 89). None when there is no
+    marker (the DLL beside the engine is the release's) or the marker names no
+    arch; "native" when the build named no arch (this machine's own card)."""
+    try:
+        with open(os.path.join(directory or HERE, LOCAL_CUDA_MARKER), encoding="utf-8") as handle:
+            arch = handle.read().strip()
+    except OSError:
+        return None
+    if arch.startswith("sm_"):
+        try:
+            return int(arch[3:])
+        except ValueError:
+            return None
+    return CUDA_ARCH_NATIVE if arch == CUDA_ARCH_NATIVE else None
+
+
+def cuda_dll_floor(arch):
+    """The oldest card the CUDA DLL runs on: the arch it was built for (a build
+    here: its SASS is that arch, and the PTX it carries JITs on the newer ones),
+    or the release's portable one (compute 8.0 and newer)."""
+    if arch is None:
+        return WINDOWS_CUDA_FLOOR
+    if arch == CUDA_ARCH_NATIVE:
+        return WINDOWS_CUDA_LOCAL_FLOOR
+    return arch
+
+
+def cuda_dll_runs(sm, arch):
+    """Whether a card of compute capability `sm` runs the CUDA DLL built for
+    `arch` (local_cuda_arch): the card it was built for and the newer ones (the
+    build carries the PTX of its arch, which the driver JITs), or, for the
+    release's portable DLL, compute 8.0 and newer. A build below 7.5 does not
+    run on a card of 7.5 or newer: the s4 wmma kernels are compiled only for
+    sm_75 and up, and the gate that uses them follows the card's capability, so
+    it would run an empty kernel and keep the previous call's data (#1499)."""
+    if sm is None:
+        return False
+    if isinstance(arch, int) and arch < 75 <= sm:
+        return False
+    return sm >= cuda_dll_floor(arch)
+
+
+def cuda_dll_why(dll, arch, card, sm):
+    """Why the card cannot run the DLL: the release's is portable (compute 8.0 and
+    newer), a local build was made for an arch (the marker names it)."""
+    cap = f"compute {card['compute_cap']}" if sm is not None else "of unknown compute"
+    if isinstance(arch, int):
+        return (f"{dll} was built for compute {arch / 10:.1f}, and the "
+                f"{card['name']} is {cap}")
+    floor = WINDOWS_CUDA_FLOOR if arch is None else WINDOWS_CUDA_LOCAL_FLOOR
+    return f"{dll} runs on compute {floor / 10:.1f} and newer, and the {card['name']} is {cap}"
+
+
 #: The release archives whose engines are built with Vulkan (release.yml, VK=1).
 RELEASE_VULKAN = ("linux-x86_64.tar.gz", "windows-x86_64.zip")
 #: The engines the release's windows-x86_64-cuda.zip (RELEASE_CUDA_WIN32) carries, built against
@@ -773,6 +849,15 @@ RELEASE_VULKAN = ("linux-x86_64.tar.gz", "windows-x86_64.zip")
 WINDOWS_CUDA_ENGINES = ("glm", "glm53", "qwen36", "qwen38", "kimi", "deepseek_v41", "mimo", "inkling",
                         "olmoe", "laya", "gliner_decide")
 WINDOWS_CUDA_FLOOR = 80
+#: A CUDA DLL built here (build_engine.bat, the card's own arch): it runs on the
+#: card it was built for and on the newer ones (the build carries the PTX of
+#: that arch, which the driver JITs), so the floor is the arch it was built for.
+#: The oldest architecture the project's CUDA toolkit (13.x) builds for is the
+#: floor of a build whose arch could not be read.
+WINDOWS_CUDA_LOCAL_FLOOR = 75
+LOCAL_CUDA_MARKER = "coli_cuda.local"
+#: What the marker says when the build named no arch: this machine's own card.
+CUDA_ARCH_NATIVE = "native"
 RELEASE_CUDA_WIN32 = "windows-x86_64-cuda.zip"
 #: The engines the package got later, each with the last release whose package lacks it:
 #: v2.1.0's has no glm53.exe (#2541), no qwen38.exe (#2846) and none of deepseek_v41.exe,
@@ -825,12 +910,35 @@ def engine_path(directory, family):
 CUDA_WITH_VULKAN = ("qwen36", "qwen38", "glm", "kimi", "inkling", "deepseek_v4", "glm53", "deepseek_v41", "mimo")
 
 
+def msys2_env():
+    """The environment MSYS2's tools (bash, make) need: the UCRT64 environment, so
+    the tools on the PATH are the ones MSYS2 ships."""
+    return dict(os.environ, MSYSTEM="UCRT64", CHERE_INVOKING="1", MSYS2_PATH_TYPE="inherit")
+
+
 def make_command(family, backend, tc, make_args=()):
     """The make invocation for this engine and backend (argv, cwd, env).
     `make_args` are the extra variables the decision asked for
     (cuda_make_args): they come last, and a CUDA_ARCH among them replaces
     the default one."""
     target = family.build_target
+    if host_os() == "win32" and backend == "cuda":
+        # The Windows CUDA build is TWO make targets: the host engine, which links
+        # the runtime loader (make <target> CUDA_DLL=1), and coli_cuda.dll, which
+        # carries the backend (make CUDA_DLL=1 cuda-dll). Building only the DLL
+        # leaves a CPU-only binary behind that cannot use the card. nvcc needs the
+        # MSVC environment, which build_engine.bat sets up with vcvars64.bat; the
+        # Makefile's recipes are POSIX shell, so it runs make from MSYS2.
+        bat_path = os.path.join(HERE, "build_engine.bat")
+        env = msys2_env()
+        if tc.get("msys2"):
+            env["COLI_MSYS2"] = tc["msys2"]
+        if tc.get("make"):
+            env["COLI_MAKE"] = tc["make"]
+        for arg in make_args:
+            key, _, value = arg.partition("=")
+            env[key] = value
+        return [bat_path, "cuda", target], HERE, env
     args = [target, f"ARCH={os.environ.get('ARCH') or 'native'}"]
     if backend == "vulkan":
         args.append("VK=1")
@@ -847,8 +955,7 @@ def make_command(family, backend, tc, make_args=()):
     if host_os() == "win32" and tc.get("msys2"):
         bash = os.path.join(tc["msys2"], "usr", "bin", "bash.exe")
         script = 'cd "$(cygpath -u "$1")" && shift && exec make "$@"'
-        env = dict(os.environ, MSYSTEM="UCRT64", CHERE_INVOKING="1", MSYS2_PATH_TYPE="inherit")
-        return [bash, "-lc", script, "colibri-build", HERE] + args, HERE, env
+        return [bash, "-lc", script, "colibri-build", HERE] + args, HERE, msys2_env()
     return [tc.get("make") or "make", "-C", HERE] + args, HERE, dict(os.environ)
 
 
@@ -872,12 +979,19 @@ def build_engine(family, backend, tc, out=print, make_args=(), update=False):
     redoes only what changed since it was built."""
     cmd, cwd, env = make_command(family, backend, tc, make_args)
     shown = [a for a in cmd if a == family.build_target or re.match(r"^[A-Z_]+=", a)]
+    if cmd[0].endswith(".bat"):
+        # The Windows CUDA build goes through build_engine.bat (it sets up MSVC
+        # and runs both make targets); show it, not the make line it stands for.
+        shown = [os.path.basename(cmd[0])] + list(cmd[1:])
+        prefix = ""
+    else:
+        prefix = "make "
     log_file = log_path(build_log_name(backend))
     if update:
-        out(f"  updating: make {' '.join(shown)}  (only what changed since the last build; "
+        out(f"  updating: {prefix}{' '.join(shown)}  (only what changed since the last build; "
             f"log: {log_file})")
     else:
-        out(f"  building: make {' '.join(shown)}  (a few minutes; log: {log_file})")
+        out(f"  building: {prefix}{' '.join(shown)}  (a few minutes; log: {log_file})")
     write_state("build", engine=family.engine_artifact, backend=backend)
     with open(_ensure_log(build_log_name(backend)), "w", encoding="utf-8", errors="replace") as log:
         process = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE,
@@ -892,6 +1006,14 @@ def build_engine(family, backend, tc, out=print, make_args=(), update=False):
         detail = "\n".join("    " + line for line in tail[-12:])
         raise BuildError(f"the {family.build_target} {BACKEND_NAME[backend]} build "
                          f"failed (full log: {log_file}):\n{detail}", backend, log_file)
+    if backend != "cpu" and backend not in binary_backends(path):
+        # The engine is the one that was here, not the one just built: the build
+        # left it alone (a CUDA build that only made the DLL, say) and the old
+        # CPU-only binary would run as if it had the backend.
+        raise BuildError(f"the {family.build_target} {BACKEND_NAME[backend]} build did not "
+                         f"produce a {BACKEND_NAME[backend]} engine: {os.path.basename(path)} "
+                         f"is a {BACKEND_NAME[binary_backend(path)]} build (full log: {log_file})",
+                         backend, log_file)
     return path
 
 
@@ -1066,6 +1188,12 @@ def fetch_release_cuda(directory, tag, out=print, getter=None):
     for entry in sorted(os.listdir(staging), key=lambda entry: entry == "coli_cuda.dll"):
         os.replace(os.path.join(staging, entry), os.path.join(directory, entry))
     shutil.rmtree(staging, ignore_errors=True)
+    # The release's own DLL has no marker: a marker of a DLL built here would say
+    # the wrong floor beside it (the release's runs on compute 8.0 and newer).
+    try:
+        os.remove(os.path.join(directory, LOCAL_CUDA_MARKER))
+    except OSError:
+        pass
     return True
 
 
@@ -2022,7 +2150,10 @@ def cuda_unused(cfg):
         return None
     sms = [setup_hw.compute_cap_sm(card.get("compute_cap")) for card in cards]
     if host_os() == "win32":
-        if family.id not in WINDOWS_CUDA_ENGINES or sms[0] is None or sms[0] < WINDOWS_CUDA_FLOOR:
+        # A DLL built here runs on the card it was built for (local_cuda_arch); the
+        # release's is portable (WINDOWS_CUDA_FLOOR).
+        arch = local_cuda_arch(os.path.dirname(os.path.abspath(engine)))
+        if family.id not in WINDOWS_CUDA_ENGINES or not cuda_dll_runs(sms[0], arch):
             return None
         where = "coli_cuda.dll beside the engine"
     else:

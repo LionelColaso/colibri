@@ -175,9 +175,17 @@ class BackendChoice(unittest.TestCase):
 
     def test_nvidia_with_toolkit_takes_cuda(self):
         self.assertEqual(self.choose(hw_report(vulkan=IGPU, nvidia=[RTX]))["backend"], "cuda")
-        # The Windows CUDA build is a separate MSVC build: Vulkan there.
+        # On Windows the CUDA build is made here too: the DLL and the host that
+        # loads it (build_engine.bat), for the card in this machine.
         self.assertEqual(self.choose(hw_report(vulkan=IGPU, nvidia=[RTX]), platform="win32")["backend"],
-                         "vulkan")
+                         "cuda")
+        # Without the CUDA toolkit there, it stays on Vulkan and says what to install.
+        decision = self.choose(hw_report(vulkan=IGPU, nvidia=[RTX]),
+                               tc=dict(TC_ALL, nvcc=None), platform="win32")
+        self.assertEqual(decision["backend"], "vulkan")
+        self.assertEqual(decision["missing"][0][0], "cuda")
+        self.assertIn("the Windows CUDA build needs the CUDA Toolkit and MSVC",
+                      decision["missing"][0][1])
 
     def test_nvidia_without_toolkit_falls_to_vulkan_and_says_how(self):
         tc = dict(TC_ALL, nvcc=None, can_build_cuda=False)
@@ -298,6 +306,112 @@ class BackendChoice(unittest.TestCase):
             self.assertEqual(decision["missing"][0][0], "cuda")
             self.assertIn("windows-x86_64-cuda.zip", decision["missing"][0][1])
 
+    def test_a_cuda_dll_built_here_runs_on_the_card_it_was_built_for(self):
+        # The release's CUDA package is portable (sm_80 and newer), but a DLL built
+        # here is built for this card (the arch the marker names): build_engine.bat
+        # leaves the marker beside it and the setup reads it. So a 7.5 card takes
+        # the local build, where the release's DLL would not run at all.
+        tc = dict(TC_ALL, source_checkout=False, make=None, cc=None, can_build=False,
+                  can_build_vulkan=False, can_build_cuda=False)
+        rtx_vk = {"name": RTX["name"], "type": "discrete", "api_version": "1.3.289",
+                  "api_version_raw": (1 << 22) | (3 << 12) | 289}
+        with tempfile.TemporaryDirectory() as here:
+            self.windows_cuda_here(here)
+            Path(here, setup_flow.LOCAL_CUDA_MARKER).write_text("sm_75")
+            card = dict(RTX, name="NVIDIA GeForce RTX 2070", compute_cap="7.5")
+            decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[card]), tc=tc,
+                                   platform="win32", here=here)
+            self.assertEqual(decision["backend"], "cuda")
+            self.assertIn("coli_cuda.dll beside the engine", decision["reason"])
+            # a card below what the toolkit still builds for (CUDA 13 starts at 7.5)
+            old = dict(RTX, name="NVIDIA GeForce GTX 1080 Ti", compute_cap="6.1")
+            decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[old]), tc=tc,
+                                   platform="win32", here=here)
+            self.assertEqual(decision["backend"], "vulkan")
+            self.assertIn("was built for compute 7.5, and the NVIDIA GeForce GTX 1080 Ti is compute 6.1",
+                          decision["reason"])
+
+    def test_a_local_cuda_dll_runs_on_the_newer_cards_too(self):
+        # The build carries the PTX of the arch it was built for (an explicit
+        # CUDA_ARCH), which the driver JITs on the newer cards: so a DLL built for
+        # sm_75 runs on an 8.9 card as well, and the setup hands it over.
+        tc = dict(TC_ALL, source_checkout=False, make=None, cc=None, can_build=False,
+                  can_build_vulkan=False, can_build_cuda=False)
+        rtx_vk = {"name": RTX["name"], "type": "discrete", "api_version": "1.3.289",
+                  "api_version_raw": (1 << 22) | (3 << 12) | 289}
+        with tempfile.TemporaryDirectory() as here:
+            self.windows_cuda_here(here)
+            Path(here, setup_flow.LOCAL_CUDA_MARKER).write_text("sm_75")
+            ada = dict(RTX, name="NVIDIA GeForce RTX 4090", compute_cap="8.9")
+            decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[ada]), tc=tc,
+                                   platform="win32", here=here)
+            self.assertEqual(decision["backend"], "cuda")
+            self.assertIn("coli_cuda.dll beside the engine", decision["reason"])
+
+    def test_a_cuda_dll_built_below_7_5_does_not_run_on_a_7_5_card(self):
+        # The s4 wmma kernels are compiled only for sm_75 and up, and the gate that
+        # uses them follows the card's capability: a build below 7.5 on a card of
+        # 7.5 or newer would run an empty kernel and keep the previous call's
+        # data (#1499). So such a build stays with the cards it was made for.
+        tc = dict(TC_ALL, source_checkout=False, make=None, cc=None, can_build=False,
+                  can_build_vulkan=False, can_build_cuda=False)
+        rtx_vk = {"name": RTX["name"], "type": "discrete", "api_version": "1.3.289",
+                  "api_version_raw": (1 << 22) | (3 << 12) | 289}
+        with tempfile.TemporaryDirectory() as here:
+            self.windows_cuda_here(here)
+            Path(here, setup_flow.LOCAL_CUDA_MARKER).write_text("sm_70")
+            for name, cap in (("NVIDIA GeForce RTX 2070", "7.5"),
+                              ("NVIDIA GeForce RTX 4090", "8.9")):
+                card = dict(RTX, name=name, compute_cap=cap)
+                decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[card]), tc=tc,
+                                       platform="win32", here=here)
+                self.assertEqual(decision["backend"], "vulkan")
+                self.assertIn("was built for compute 7.0", decision["reason"])
+            # the card it was built for takes it
+            volta = dict(RTX, name="NVIDIA Tesla V100", compute_cap="7.0")
+            decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[volta]), tc=tc,
+                                   platform="win32", here=here)
+            self.assertEqual(decision["backend"], "cuda")
+
+    def test_the_windows_cuda_build_is_made_here_for_the_card(self):
+        # A compiler and the CUDA toolkit here: the Windows CUDA build is made
+        # here (the DLL and the host that loads it, build_engine.bat), for the
+        # card in this machine. So a card the release's portable DLL cannot
+        # reach (7.5) takes CUDA too, built for that card.
+        rtx_vk = {"name": RTX["name"], "type": "discrete", "api_version": "1.3.289",
+                  "api_version_raw": (1 << 22) | (3 << 12) | 289}
+        card = dict(RTX, name="NVIDIA GeForce RTX 2070", compute_cap="7.5")
+        decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[card]), platform="win32")
+        self.assertEqual(decision["backend"], "cuda")
+        self.assertIn("with the CUDA toolkit", decision["reason"])
+
+    def test_a_card_the_toolkit_cannot_build_for_stays_on_vulkan(self):
+        # The toolkit's own answer about the cards it builds for (toolkit_builds),
+        # as on Linux: CUDA 13 cannot build for a 6.1 card, so the setup says so
+        # and keeps the card on Vulkan.
+        rtx_vk = {"name": RTX["name"], "type": "discrete", "api_version": "1.3.289",
+                  "api_version_raw": (1 << 22) | (3 << 12) | 289}
+        old = dict(RTX, name="NVIDIA GeForce GTX 1080 Ti", compute_cap="6.1")
+        tc = dict(TC_ALL, **nvcc_toolkit("13.0.88"))
+        decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[old]), tc=tc, platform="win32")
+        self.assertEqual(decision["backend"], "vulkan")
+        self.assertIn("the CUDA 13.0 toolkit cannot build for the NVIDIA GeForce GTX 1080 Ti "
+                      "(compute 6.1, dropped in CUDA 13)", decision["reason"])
+        self.assertEqual(decision["missing"][0][0], "cuda")
+    def test_the_release_cuda_dll_still_asks_for_compute_8_and_newer(self):
+        # The release's DLL is portable (CUDA_ARCH=portable: SASS for sm_80 and
+        # newer), so a card below 8.0 does not take it, and the setup says so.
+        tc = dict(TC_ALL, source_checkout=False, make=None, cc=None, can_build=False,
+                  can_build_vulkan=False, can_build_cuda=False)
+        rtx_vk = {"name": RTX["name"], "type": "discrete", "api_version": "1.3.289",
+                  "api_version_raw": (1 << 22) | (3 << 12) | 289}
+        card = dict(RTX, name="NVIDIA GeForce RTX 2070", compute_cap="7.5")
+        decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[card]), tc=tc,
+                               platform="win32")
+        self.assertEqual(decision["backend"], "vulkan")
+        self.assertIn("the release's coli_cuda.dll runs on compute 8.0 and newer, "
+                      "and the NVIDIA GeForce RTX 2070 is compute 7.5", decision["reason"])
+
     def test_windows_without_engines_takes_the_release_cuda_backend(self):
         # #2091: with nothing here, the setup takes the Windows release, whose CUDA
         # backend it fetches too (fetch_release_cuda); before, it took only the Vulkan
@@ -321,13 +435,15 @@ class BackendChoice(unittest.TestCase):
         decision = self.choose(hw_report(vulkan=DGPU, nvidia=[old]), family="kimi", tc=tc, platform="win32")
         self.assertEqual(decision["backend"], "vulkan")
         self.assertIn("the release's coli_cuda.dll runs on compute 8.0", decision["reason"])
-        # an engine the release carries no CUDA build of, or a compiler here: as before
+        # an engine the release carries no CUDA build of: as before
         with no_cuda_path("olmoe"):
             decision = self.choose(hw_report(vulkan=DGPU, nvidia=[card]), family="olmoe", tc=tc, platform="win32")
         self.assertEqual(decision["backend"], "vulkan")
+        # a compiler here: the CUDA build is made here instead (the DLL and the
+        # host that loads it), for the card in this machine
         decision = self.choose(hw_report(vulkan=DGPU, nvidia=[card]), family="kimi", platform="win32")
-        self.assertEqual(decision["backend"], "vulkan")
-        self.assertEqual(decision["missing"][0][0], "cuda")
+        self.assertEqual(decision["backend"], "cuda")
+        self.assertIn("with the CUDA toolkit", decision["reason"])
         # and on Linux the release has no CUDA backend to fetch
         decision = self.choose(hw_report(vulkan=DGPU, nvidia=[card]), family="kimi", tc=tc)
         self.assertNotEqual(decision["backend"], "cuda")
@@ -340,8 +456,10 @@ class BackendChoice(unittest.TestCase):
         release = dict(TC_ALL, source_checkout=False, make=None, cc=None, can_build=False,
                        can_build_vulkan=False, can_build_cuda=False)
         with mock.patch.object(setup_flow, "current_version", return_value="2.1.0"):
+            # a compiler here: the build is made here, so the release's package
+            # (which has no glm53 CUDA build) is not what runs
             decision = self.choose(hw, family="glm53", platform="win32")
-            self.assertEqual(decision["backend"], "vulkan")
+            self.assertEqual(decision["backend"], "cuda")
             self.assertEqual(decision["missing"], [])
             with tempfile.TemporaryDirectory() as here:
                 self.windows_cuda_here(here)
@@ -354,10 +472,13 @@ class BackendChoice(unittest.TestCase):
                 decision = self.choose(hw, family="glm53", tc=release, platform="win32", here=here)
                 self.assertEqual(decision["backend"], "cuda")
                 self.assertIn("coli_cuda.dll beside the engine", decision["reason"])
-        # with the release after it, the hint the other three engines get
+        # with the release after it, the hint the other three engines get: an
+        # engine here and nothing to build with, and its package has this one
         with mock.patch.object(setup_flow, "current_version", return_value="2.2.0"):
-            decision = self.choose(hw, family="glm53", platform="win32")
-        self.assertEqual(decision["missing"], [("cuda", setup_flow.TEXT_HINTS["cuda-win32-release"])])
+            with tempfile.TemporaryDirectory() as here:
+                Path(here, "glm53.exe").write_bytes(b"MZ vulkan-1.dll")
+                decision = self.choose(hw, family="glm53", tc=release, platform="win32", here=here)
+        self.assertIn(("cuda", setup_flow.TEXT_HINTS["cuda-win32-release"]), decision["missing"])
 
     def test_an_nvidia_card_with_no_path_says_why(self):
         # #2846: an A100 in TCC mode has no Vulkan device on Windows. Qwen3.8 takes the
@@ -1090,7 +1211,117 @@ class EngineResolution(HomeTestCase):
             self.assertIn("CUDA=1", cmd)
             self.assertIn("CUDA_ARCH=native", cmd)
 
+    def test_the_windows_cuda_build_goes_through_the_bat_with_the_target(self):
+        """The Windows CUDA build is build_engine.bat: it sets up MSVC (nvcc's host
+        compiler) and runs both make targets. It needs the engine's target, and the
+        make variables the decision asked for, as the environment."""
+        tc = dict(TC_ALL, msys2=r"C:\msys64", make=r"C:\msys64\usr\bin\make.exe")
+        with modeled("win32"):
+            cmd, cwd, env = setup_flow.make_command(family_by_id("qwen36"), "cuda", tc,
+                                                     ["CUDA_ARCH=sm_70"])
+        self.assertTrue(cmd[0].endswith("build_engine.bat"))
+        self.assertEqual(cmd[1:], ["cuda", "qwen36"])
+        self.assertEqual(env["CUDA_ARCH"], "sm_70")
+        self.assertEqual(env["COLI_MSYS2"], r"C:\msys64")
+        self.assertEqual(env["COLI_MAKE"], r"C:\msys64\usr\bin\make.exe")
+        # the bat, not the msys2 bash: the recipes need cl.exe, which only the
+        # bat's vcvars64.bat puts on the PATH
+        self.assertFalse(cmd[0].endswith("bash.exe"))
+        self.assertTrue(os.path.isfile(cmd[0]))
 
+    def test_the_windows_cuda_bat_builds_the_host_and_the_dll(self):
+        """The CUDA engine is two things: the host, which links the runtime loader,
+        and coli_cuda.dll, which carries the backend. Building only the DLL leaves
+        a CPU-only binary that cannot use the card."""
+        bat = Path(C_DIR, "build_engine.bat").read_text()
+        self.assertIn("CUDA_DLL=1 ARCH=%ARCH% %TARGET%", bat)
+        self.assertIn("CUDA_DLL=1 ARCH=%ARCH% cuda-dll", bat)
+
+    def test_the_windows_cuda_bat_builds_for_the_card_in_this_machine(self):
+        """CUDA_ARCH is the card's own arch (sm_89, sm_120, ...), detected from
+        nvidia-smi: an explicit arch makes nvcc put the PTX of that arch in the
+        DLL beside its SASS, so the driver JITs it on the newer cards and the DLL
+        runs on the card it was built for and on the newer ones. The setup reads
+        the marker beside it to know which."""
+        bat = Path(C_DIR, "build_engine.bat").read_text()
+        self.assertIn("nvidia-smi -i 0 --query-gpu=compute_cap", bat)
+        self.assertIn('set "LOCAL_ARCH=sm_%%a%%b"', bat)
+        self.assertIn(f">{setup_flow.LOCAL_CUDA_MARKER} echo %LOCAL_ARCH%", bat)
+
+    def test_the_visual_studio_setup_is_shared_and_covers_vs_2017_to_18(self):
+        """One script sets up MSVC for both build wrappers (they need the same
+        thing: nvcc's host compiler). The version range covers VS 2017 (15.x)
+        through VS 18, so a machine with a newer Visual Studio is found by the
+        first query, without the warning."""
+        helper = Path(C_DIR, "msvc_env.bat").read_text()
+        self.assertIn('-version "[15.0,19.0)"', helper)
+        for bat in ("build_engine.bat", "build_cuda.bat"):
+            self.assertIn('call "%~dp0msvc_env.bat"', Path(C_DIR, bat).read_text())
+
+    def test_the_standalone_cuda_bat_compiles_the_sources_the_makefile_does(self):
+        """The DLL is four translation units. backend_cuda.cu alone builds and links
+        fine, but the DLL is then missing the three OPTIONAL entry points the loader
+        resolves with RESOLVE_OPT -- the chain, the GPU expert tier and Inkling's
+        bf16 path -- and they turn themselves off silently: the engine runs on a
+        smaller GPU footprint than it should, with nothing to say why. The two
+        source lists must not drift; this test fails when they do."""
+        makefile = Path(C_DIR, "Makefile").read_text()
+        target = next(line for line in makefile.splitlines() if line.startswith("cuda-dll:"))
+        make_sources = set(re.findall(r"[\w.]+\.cu", target))
+        self.assertTrue(make_sources, "the Makefile's cuda-dll target lists no sources")
+
+        bat = Path(C_DIR, "build_cuda.bat").read_text()
+        joined = bat.replace("^\r\n", " ").replace("^\n", " ")
+        command = next(line for line in joined.splitlines() if "-o coli_cuda.dll" in line)
+        bat_sources = set(re.findall(r"[\w.]+\.cu", command))
+        self.assertEqual(make_sources, bat_sources)
+
+    def test_the_standalone_cuda_bat_keeps_the_denormals_the_cpu_path_keeps(self):
+        """nvcc flushes denormals to zero by default; the Makefile's cuda-dll turns
+        that off (-ftz=false) so the CUDA path and the CPU path agree on the
+        denormals. The standalone bat builds the same DLL, so it takes the same
+        flag."""
+        bat = Path(C_DIR, "build_cuda.bat").read_text()
+        self.assertIn("-ftz=false", bat)
+
+    def test_the_standalone_cuda_bat_builds_for_the_card_in_this_machine(self):
+        """The DLL it builds is this machine's own backend (the card's own arch,
+        detected from nvidia-smi), the way the release's portable one is not: the
+        setup can run it on a card below compute 8.0."""
+        bat = Path(C_DIR, "build_cuda.bat").read_text()
+        self.assertIn("nvidia-smi -i 0 --query-gpu=compute_cap", bat)
+        self.assertIn("-arch=%CUDA_ARCH%", bat)
+        self.assertIn(f'>"%~dp0{setup_flow.LOCAL_CUDA_MARKER}" echo %CUDA_ARCH%', bat)
+
+    def test_a_build_that_leaves_the_cpu_engine_is_not_a_cuda_build(self):
+        """The engine that was here is not the one just built: a CUDA build that
+        only made the DLL leaves the CPU engine behind, and it must not be handed
+        back as a CUDA build."""
+        process = mock.Mock()
+        process.returncode = 0
+        process.stdout = []
+        with tempfile.TemporaryDirectory() as engines:
+            path = Path(engines, engine_name("win32"))
+            path.write_bytes(b"MZ a cpu-only engine")
+            with modeled("win32"), mock.patch.object(setup_flow, "HERE", engines), \
+                    mock.patch.object(setup_flow.subprocess, "Popen", return_value=process):
+                with self.assertRaises(setup_flow.BuildError) as caught:
+                    setup_flow.build_engine(family_by_id("qwen36"), "cuda", TC_ALL,
+                                            out=lambda *a: None)
+        self.assertIn("did not produce a CUDA engine", str(caught.exception))
+
+    def test_a_cuda_engine_the_build_produced_is_taken(self):
+        process = mock.Mock()
+        process.returncode = 0
+        process.stdout = []
+        with tempfile.TemporaryDirectory() as engines:
+            path = Path(engines, engine_name("win32"))
+            path.write_bytes(b"MZ coli_cuda.dll")
+            with modeled("win32"), mock.patch.object(setup_flow, "HERE", engines), \
+                    mock.patch.object(setup_flow.subprocess, "Popen", return_value=process):
+                built = setup_flow.build_engine(family_by_id("qwen36"), "cuda", TC_ALL,
+                                                out=lambda *a: None)
+        self.assertEqual(built, str(path))
 class Releases(HomeTestCase):
     def test_asset_names(self):
         suffix = setup_flow.release_asset_suffix
@@ -1806,7 +2037,6 @@ class WholeSetup(HomeTestCase):
         cfg = setup_flow.load_config()
         self.assertEqual((cfg["backend"], cfg["failed_builds"], cfg["gpu_pending"]),
                          ("cpu", ["cuda", "vulkan"], []))  # nothing to install: no rebuild on rerun
-
     def test_a_failed_cpu_build_stops(self):
         os.remove(os.path.join(self.engines, "qwen36"))
         build, calls = self.failing_build("cpu")
@@ -2540,6 +2770,19 @@ class ConfiguredCuda(Releases):
         with modeled("win32"):
             self.assertIsNone(setup_flow.cuda_unused(self.configured(without)))
 
+    def test_a_cuda_dll_built_here_moves_the_saved_setup_to_cuda(self):
+        # The DLL beside the engine was built here (the marker): it is built for
+        # this card, so a 7.5 card takes CUDA where the release's DLL cannot run.
+        engines = os.path.join(self.tmp.name, "built")
+        self.windows_engines(engines)
+        Path(engines, setup_flow.LOCAL_CUDA_MARKER).write_text("sm_75")
+        cfg = self.configured(engines, cards=[{"name": "NVIDIA GeForce RTX 2070",
+                                                "compute_cap": "7.5"}])
+        with modeled("win32"):
+            reason = setup_flow.cuda_unused(cfg)
+        self.assertIsNotNone(reason)
+        self.assertIn("RTX 2070", reason)
+
     def test_a_release_engine_from_an_older_setup_gets_its_cuda_backend(self):
         # the reporter's state: the release's Vulkan engines in runtime/, COLI_VULKAN=1
         runtime = os.path.join(self.home, "runtime", "colibri-v2.1.0")
@@ -2553,6 +2796,21 @@ class ConfiguredCuda(Releases):
         self.assertEqual(cfg["backend"], "cuda")
         self.assertTrue(os.path.isfile(os.path.join(runtime, "coli_cuda.dll")))
         self.assertNotIn("COLI_VULKAN", cfg["env"])
+
+    def test_the_release_cuda_backend_clears_a_stale_marker(self):
+        # A marker says the DLL beside it was built here; the release's own DLL has
+        # none, and a marker left beside it would say the wrong floor (compute 8.0
+        # and newer, not the 7.5 the marker names).
+        runtime = os.path.join(self.home, "runtime", "colibri-v2.1.0")
+        self.windows_engines(runtime, dll=False)
+        marker = Path(runtime, setup_flow.LOCAL_CUDA_MARKER)
+        marker.write_text("sm_75")
+        self.configured(runtime)
+        getter = self.windows_release("v2.1.0", "release")
+        with modeled("win32"), mock.patch.object(setup_flow, "_api_get", side_effect=getter):
+            self.rerun()
+        self.assertTrue(os.path.isfile(os.path.join(runtime, "coli_cuda.dll")))
+        self.assertFalse(marker.exists())
 
     def test_a_release_without_a_cuda_backend_is_asked_once(self):
         runtime = os.path.join(self.home, "runtime", "colibri-v2.1.0")

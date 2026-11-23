@@ -5,6 +5,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### New
+
+- **`coli setup` builds the Windows CUDA backend here, for any card**: with a
+  compiler and the CUDA Toolkit on the machine it runs `c/build_engine.bat` —
+  the DLL and the host that loads it, for the card's own compute capability
+  (`sm_75` on a GTX 1650, the arch's PTX included so newer cards JIT it) — where
+  before the setup stayed on Vulkan unless a release's portable `coli_cuda.dll`
+  (compute 8.0 and newer) was already beside the engine. The build leaves
+  `coli_cuda.local` beside the DLL naming the arch, so the setup knows which
+  cards the DLL serves and never hands a card one it cannot load; a card the
+  toolkit cannot build for (CUDA 13 dropped compute 6.1) keeps the reason and
+  the fix instead of a build that cannot work.
+
 ## [2.2.0] - 2026-11-21
 
 ### New

@@ -4,7 +4,8 @@ rem build_cuda.bat - one-shot build of coli_cuda.dll (Windows, nvcc + MSVC).
 rem
 rem Mirrors the Makefile's `cuda-dll` recipe so it can be double-clicked or run
 rem from a plain shell: it locates vcvars64.bat and the CUDA toolkit itself
-rem rather than hardcoding install paths.
+rem rather than hardcoding install paths. The same four sources, the same
+rem flags - keep the two in step (the source list is spelled out at the build).
 rem
 rem Overrides (set before calling):
 rem   CUDA_ARCH   GPU compute capability (sm_NNN). Auto-detected from the
@@ -33,34 +34,14 @@ echo WARNING: could not detect GPU compute capability; defaulting to sm_120.>&2
 set "CUDA_ARCH=sm_120"
 :have_arch
 set "CC="
-set "VSINSTALLER=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer"
-set "VSWHERE=%VSINSTALLER%\vswhere.exe"
 
 rem --- MSVC: nvcc needs cl.exe as its host compiler -------------------------
-rem Prefer the VS 2022 toolset (range [17.0,18.0)); fall back to -latest if no
-rem 2022 install exists.
+rem msvc_env.bat finds a Visual Studio and calls its vcvars64.bat; the
+rem environment it sets up stays for this script (same process).
 if not "%CCBIN%"=="" goto have_msvc
-where cl.exe >nul 2>&1
+call "%~dp0msvc_env.bat"
 if %ERRORLEVEL%==0 goto have_msvc
-
-if not exist "%VSWHERE%" goto no_msvc
-
-rem Invoke vswhere by bare name from its own directory.
-set "VSDIR="
-pushd "%VSINSTALLER%"
-for /f "usebackq delims=" %%i in (`vswhere.exe -products * -version "[17.0,18.0)" -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSDIR=%%i"
-if not "%VSDIR%"=="" goto found_vs
-echo WARNING: no VS 2017-2022 found; falling back to the newest install.>&2
-echo          If nvcc reports "unsupported Microsoft Visual Studio version",>&2
-echo          install the 2022 toolset - see the error text at the end.>&2
-for /f "usebackq delims=" %%i in (`vswhere.exe -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSDIR=%%i"
-:found_vs
-popd
-if "%VSDIR%"=="" goto no_msvc
-if not exist "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" goto no_msvc
-call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul
-where cl.exe >nul 2>&1
-if not %ERRORLEVEL%==0 goto no_msvc
+goto no_msvc
 :have_msvc
 
 rem -ccbin pins the host compiler explicitly.
@@ -88,15 +69,30 @@ rem lands next to colibri.exe.
 pushd "%~dp0"
 
 echo Building coli_cuda.dll for %CUDA_ARCH% ...
+rem The SAME four sources as the Makefile's `cuda-dll` target (c/Makefile), and
+rem the same flags (-ftz=false keeps the denormals the CPU path keeps). The
+rem source list must match: backend_cuda.cu alone builds and links fine, but
+rem the DLL is then missing the three OPTIONAL entry points the loader resolves
+rem with RESOLVE_OPT -- coli_cuda_chain_ops (cuda_chain.cu), coli_cuda_tier_ops
+rem (cu_xb.cu) and coli_cuda_ink_ops (backend_cuda_ink.cu). A missing one does
+rem not fail the load: the CUDA chain, the GPU expert tier and Inkling's bf16
+rem path turn themselves off, silently, and the engine runs on a smaller GPU
+rem footprint than it should. If a source is added to the Makefile's target,
+rem add it here too.
 rem -Xcompiler=-W3 sets the MSVC host-compiler warning level.
-"%NVCC%" -O3 -std=c++17 -arch=%CUDA_ARCH% -Xcompiler=-W3 -shared ^
+"%NVCC%" -O3 -std=c++17 -ftz=false -arch=%CUDA_ARCH% -Xcompiler=-W3 -shared ^
     %CCBIN_FLAG% %UNSUPPORTED_FLAG% ^
     -DCOLI_CUDA_BUILDING_DLL %CUDA_LIB% -lcudart ^
-    backend_cuda.cu -o coli_cuda.dll
+    backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda_ink.cu -o coli_cuda.dll
 set "RC=%ERRORLEVEL%"
 
 popd
 if not "%RC%"=="0" goto failed
+rem The marker: this DLL was built here, for the arch above. The setup reads it to
+rem know the card the DLL was made for: a local build runs on that card and on
+rem the newer ones, where the release's portable DLL (sm_80 and newer) cannot.
+rem It goes beside the DLL, which is in this script's own directory.
+>"%~dp0coli_cuda.local" echo %CUDA_ARCH%
 echo.
 echo OK: %~dp0coli_cuda.dll
 echo Now build the host with the runtime loader:

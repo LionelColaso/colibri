@@ -48,6 +48,7 @@ c/backend_loader.o
 c/coli_cuda.dll
 c/coli_cuda.lib
 c/coli_cuda.exp
+c/coli_cuda.local
 c/coli_hip.dll
 c/coli_hip.lib
 c/coli_hip.exp
