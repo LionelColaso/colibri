@@ -90,6 +90,7 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 | `--model-dir DIR` | none | Use a model already on disk instead of downloading one. |
 | `--dir DIR` | `~/colibri-models` | Folder for downloaded models. |
 | `--backend` | `auto` | `auto`, `cpu`, `vulkan` or `cuda`: the engine build. `auto` takes CUDA, then Vulkan, then the CPU. |
+| `--engine` | `auto` | `auto`, `prebuilt` or `build`: where the engine comes from. `auto` builds it here when a compiler can and takes the release otherwise; `prebuilt` takes the release's engine and never builds; `build` builds it from the sources and never downloads one (with no compiler here it stops and says so). It is a choice for that run only, not a saved setting, and it does not pick the backend — `--backend` does. |
 | `--no-gpu` | off | Same as `--backend cpu`. |
 | `--host`, `--port` | `127.0.0.1`, `8000` | Where the configured server listens. |
 | `--no-start` | off | Stop after writing the run configuration. |

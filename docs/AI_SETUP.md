@@ -128,6 +128,7 @@ rerun the same setup command.
 | `--model-dir DIR` | use a model already on disk instead of downloading |
 | `--dir DIR` | where models are downloaded (default `~/colibri-models`) |
 | `--backend auto\|cpu\|vulkan\|cuda` | force the engine build (`auto`: see below); `--no-gpu` is `--backend cpu` |
+| `--engine auto\|prebuilt\|build` | where the engine comes from: `auto` (the default) builds it here when a compiler can and takes the release otherwise, `prebuilt` takes the release's engine and never builds, `build` builds it from the sources and never downloads one |
 | `--host H`, `--port N` | where the server listens (default `127.0.0.1:8000`) |
 | `--ctx N` | the context the server starts with, kept for `coli start` (default: automatic, from the memory there is); a rerun with `--ctx` on a finished setup changes it, `--ctx 0` restores automatic, and an interrupted setup keeps the choice |
 | `--no-start` | stop after writing the configuration |

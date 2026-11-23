@@ -116,7 +116,9 @@ Useful options (`c/coli setup --help` lists them all): `--yes` takes every
 default without asking, `--model ID` picks a model (`--list` shows the ids
 against your machine), `--dir DIR` puts the models elsewhere, `--no-gpu` keeps
 everything on the CPU, `--backend vulkan` (or `cuda`) picks the GPU path
-yourself, `--model-dir DIR` uses a model you already have.
+yourself, `--model-dir DIR` uses a model you already have, and `--engine
+prebuilt` (or `build`) says where the engine comes from: the release's, or a
+build from the sources here.
 
 The rest of this page is the same thing done by hand, step by step.
 

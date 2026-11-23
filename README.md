@@ -125,6 +125,7 @@ Options go after `./start-here.sh` or `START-HERE.bat`:
 | `--yes` | no questions: take the recommendation |
 | `--dir DIR` | put the models on another disk (default `~/colibri-models`) |
 | `--backend vulkan`, `cuda` or `cpu` | choose the engine build yourself; `--no-gpu` is `--backend cpu` |
+| `--engine auto`, `prebuilt` or `build` | where the engine comes from: `auto` (the default) builds it here when a compiler can and takes the release otherwise, `prebuilt` takes the release's engine and never builds, `build` builds it from the sources and never downloads one |
 | `--model-dir DIR` | use a model you already downloaded |
 | `--reconfigure` | choose another model |
 

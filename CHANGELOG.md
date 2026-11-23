@@ -5,6 +5,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### New
+
+- **`coli setup` takes an `--engine` flag** that says where the engine comes from:
+  `auto` (the default) builds it here when a compiler can and takes the release
+  otherwise, `prebuilt` takes the release's engine and never builds, and `build`
+  builds it from the sources and never downloads one — with no compiler here it
+  stops and says so instead of handing over a release engine. It is a choice for
+  that run, and it does not pick the backend: `--backend` (or the backend the
+  setup asked for before, when it resumes) still does.
+
 ## [2.2.0] - 2026-11-21
 
 ### New

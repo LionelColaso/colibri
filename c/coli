@@ -4448,6 +4448,8 @@ def main():
     pset.add_argument("--all",action="store_true",help="also show the models that do not fit")
     pset.add_argument("--via-windows",choices=("auto","yes","no"),default="auto",
                       help="WSL only: download through Windows' curl.exe (auto: when it measures faster)")
+    pset.add_argument("--engine",choices=("auto","prebuilt","build"),default="auto",
+                      help="where the engine comes from: auto (default: build here, or the release when there is no compiler), prebuilt (the release only), build (the sources only)")
     pset.add_argument("--no-verify",action="store_true",help="skip the checksum of downloaded files")
     pset.add_argument("--json",action="store_true",
                       help="machine-readable result; implies --yes and a background start")

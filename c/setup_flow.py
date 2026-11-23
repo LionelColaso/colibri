@@ -1080,10 +1080,18 @@ def current_version():
         return "0"
 
 
-def resolve_engine(family, entry, decision, tc, out=print, allow_prebuilt=True):
+def resolve_engine(family, entry, decision, tc, out=print, engine_mode="auto"):
     """Make sure an engine for this family exists. Returns
     {"launcher_dir", "engine", "backend", "source"}; may lower the backend to
-    "cpu" when only a prebuilt engine without it is possible."""
+    "cpu" when only a prebuilt engine without it is possible.
+
+    engine_mode: "auto" (build, or the release when there is no compiler here),
+    "prebuilt" (the release, never a build) or "build" (a build, never the
+    release: with no compiler here it stops rather than downloading one)."""
+    # --engine prebuilt: the release, even when an engine is here and a compiler
+    # with it. The flag asked for the release.
+    if engine_mode == "prebuilt":
+        return _release_engine(family, entry, decision, tc, out=out)
     local = engine_path(HERE, family)
     if os.path.exists(local):
         have = binary_backend(local)
@@ -1101,13 +1109,25 @@ def resolve_engine(family, entry, decision, tc, out=print, allow_prebuilt=True):
         path = build_engine(family, decision["backend"], tc, out=out,
                             make_args=decision.get("make_args", ()))
         return {"launcher_dir": HERE, "engine": path, "backend": decision["backend"], "source": "built"}
-    if not allow_prebuilt:
+    if engine_mode == "build":
+        # --engine build asked for the sources: there are none here to build
         raise SetupError(f"no compiler here to build {family.engine_artifact}: "
                          f"{package_hint(['build'])}")
+    # no compiler here: build from source is not possible, use the release
+    return _release_engine(family, entry, decision, tc, out=out)
+
+
+def _release_engine(family, entry, decision, tc, out=print):
+    """No build (or --engine prebuilt): fetch the matching engine from the GitHub
+    release. May lower the backend to "cpu" when the release carries no such build."""
     version = current_version()
     if release_asset_suffix() is None:
-        raise SetupError(f"no compiler here, and no prebuilt engine is published for "
-                         f"{host_os()}/{host_machine()}: {package_hint(['build'])}")
+        # no compiler here, and no prebuilt engine is published for this system: the
+        # setup says both when there is no compiler; with --engine prebuilt there may
+        # be one, and only the release is missing.
+        why = "" if tc.get("can_build") else "no compiler here, and "
+        raise SetupError(f"{why}no prebuilt engine is published for {host_os()}/{host_machine()}: "
+                         f"{package_hint(['build'])}")
     # The prebuilt engines assume x86-64-v3: on an older processor they stop at their
     # first AVX2 instruction (#1979). A compiler builds one for this processor instead.
     # COLI_CPU_CHECK=0 trusts the archive anyway, as it does in the engines.
@@ -1116,7 +1136,11 @@ def resolve_engine(family, entry, decision, tc, out=print, allow_prebuilt=True):
         raise SetupError(f"this processor has no {', '.join(f.upper() for f in missing)}, which "
                          "the prebuilt engines need; with a compiler setup builds the engine for "
                          f"this processor: {package_hint(['build'])}")
-    out("  no compiler found: using the prebuilt engine from the GitHub release")
+    # Upstream's line names the reason the release is used; with --engine prebuilt
+    # the compiler here is no reason, so the line says what it did instead.
+    out("  no compiler found: using the prebuilt engine from the GitHub release"
+        if not tc.get("can_build") else
+        "  using the prebuilt engine from the GitHub release")
     runtime, tag = fetch_release_archive(version, out=out)
     if entry is not None and setup_catalog.version_tuple(tag) < setup_catalog.version_tuple(entry.prebuilt_since):
         raise SetupError(f"the published release {tag} predates {entry.name}; build from source "
@@ -1228,20 +1252,23 @@ def refresh_configured(cfg, out=print, tc=None):
     return refresh_engine(family, have, tc, engine, out=out, make_args=make_args)
 
 
-def resolve_with_fallback(ui, family, entry, decision, tc, hw, requested, failed=()):
+def resolve_with_fallback(ui, family, entry, decision, tc, hw, requested, failed=(),
+                          engine_mode="auto"):
     """resolve_engine, and when a build fails the next backend that can work
     instead of a stop: CUDA, then Vulkan, then the CPU (choose_backend again,
     without the backends that failed). With someone at the terminal it asks
     first; with --yes it goes ahead. Either way it says which build failed and
     where its log is. A CPU build that fails still stops the setup.
 
+    engine_mode: "auto" (default), "prebuilt" (use release only), "build" (from source).
     Returns (engine_info, decision, failed): the decision the engine was built
     for, and the backends whose build failed, which the run configuration
     keeps so that a resumed setup does not build them again."""
     failed = list(failed)
     while True:
         try:
-            return resolve_engine(family, entry, decision, tc, out=ui.say), decision, failed
+            return resolve_engine(family, entry, decision, tc, out=ui.say,
+                                  engine_mode=engine_mode), decision, failed
         except BuildError as error:
             if error.backend == "cpu":
                 raise
@@ -2171,7 +2198,10 @@ def cmd_setup(a, ui=None):
         return 0
 
     write_state("starting")
-    overriding = bool(a.backend or a.no_gpu or a.host is not None or a.port is not None)
+    # An engine mode of its own is a choice too: the setup that is already done
+    # must not stop at "Already set up" when the flag asks for another engine.
+    overriding = bool(a.backend or a.no_gpu or a.host is not None or a.port is not None
+                      or a.engine != "auto")
     if cfg and not picking and not overriding and config_ready(cfg):
         cfg = remember_split_dirs(cfg, out=ui.say)
         tag = release_cuda_missing(cfg)
@@ -2274,7 +2304,15 @@ def cmd_setup(a, ui=None):
     # choice (another model, --reconfigure, --backend) starts clean.
     failed = [] if (a.backend or a.no_gpu or picking or not resume) else \
         [b for b in (resume.get("failed_builds") or []) if b in ("cuda", "vulkan")]
+    engine_mode = a.engine
     decision = choose_backend(hw, family, tc, requested, exclude=tuple(failed))
+    # --engine says where the engine comes from (a build, or the release); --backend
+    # (or the backend this setup asked for before, when it resumes) says which
+    # backend it is for, and choose_backend above has already picked it.
+    if engine_mode in ("prebuilt", "build"):
+        what = "the release" if engine_mode == "prebuilt" else "the sources"
+        ui.say(f"  engine mode: {engine_mode} ({what}); "
+               f"--backend={requested} chooses the backend")
     if failed:
         decision["reason"] = (f"the {BACKEND_NAME[failed[-1]]} build failed in the last run "
                               f"(log: {log_path(build_log_name(failed[-1]))}): "
@@ -2292,7 +2330,8 @@ def cmd_setup(a, ui=None):
             raise SetupError("stopped before the download; `coli setup --reconfigure` "
                              "picks another model")
     engine_info, decision, failed = resolve_with_fallback(ui, family, entry, decision, tc, hw,
-                                                          requested, failed)
+                                                          requested, failed,
+                                                          engine_mode=engine_mode)
     if failed:
         current = load_config()
         if current:

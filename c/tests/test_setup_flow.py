@@ -120,7 +120,7 @@ def setup_args(**overrides):
     values = dict(yes=True, json=False, pick=None, ctx=None, model_dir=None, dir=None, backend=None,
                   no_gpu=False, host=None, port=None, no_start=True, background=False,
                   no_browser=True, reconfigure=False, list=False, all=False, via_windows="no",
-                  no_verify=False)
+                  no_verify=False, engine="auto")
     values.update(overrides)
     return argparse.Namespace(**values)
 
@@ -1090,6 +1090,60 @@ class EngineResolution(HomeTestCase):
             self.assertIn("CUDA=1", cmd)
             self.assertIn("CUDA_ARCH=native", cmd)
 
+    def test_the_engine_modes_choose_between_a_build_and_the_release(self):
+        """--engine build never downloads a release, --engine prebuilt never builds,
+        and --engine auto does whichever it can."""
+        family = family_by_id("qwen36")
+        decision = {"backend": "cuda", "missing": []}
+        no_build = dict(TC_ALL, can_build=False)
+        for mode, tc, built, released in (
+                ("build", TC_ALL, True, False),
+                ("prebuilt", TC_ALL, False, True),
+                ("prebuilt", no_build, False, True),
+                ("auto", TC_ALL, True, False),
+                ("auto", no_build, False, True)):
+            with self.subTest(mode=mode, compiler=tc["can_build"]):
+                with tempfile.TemporaryDirectory() as empty, \
+                        mock.patch.object(setup_flow, "HERE", empty), \
+                        mock.patch.object(setup_flow, "build_engine",
+                                          return_value=os.path.join(empty, "built")) as build, \
+                        mock.patch.object(setup_flow, "_release_engine",
+                                          return_value={"source": "release"}) as release:
+                    setup_flow.resolve_engine(family, None, decision, tc,
+                                              out=lambda *a: None, engine_mode=mode)
+                self.assertEqual(build.called, built)
+                self.assertEqual(release.called, released)
+
+    def test_engine_build_without_a_compiler_stops_instead_of_downloading(self):
+        """--engine build asked for the sources: with no compiler here it says so,
+        rather than quietly handing over a release engine."""
+        tc = dict(TC_ALL, can_build=False)
+        with tempfile.TemporaryDirectory() as empty, \
+                mock.patch.object(setup_flow, "HERE", empty), \
+                mock.patch.object(setup_flow, "_release_engine") as release:
+            with self.assertRaises(setup_flow.SetupError) as caught:
+                setup_flow.resolve_engine(family_by_id("qwen36"), None,
+                                          {"backend": "cuda", "missing": []}, tc,
+                                          out=lambda *a: None, engine_mode="build")
+        self.assertIn("no compiler here to build", str(caught.exception))
+        release.assert_not_called()
+
+    def test_engine_prebuilt_takes_the_release_over_an_engine_that_is_here(self):
+        """--engine prebuilt asked for the release: an engine in the checkout does
+        not take its place."""
+        with tempfile.TemporaryDirectory() as engines:
+            Path(engines, engine_name("win32")).write_bytes(b"MZ coli_cuda.dll")
+            with modeled("win32"), mock.patch.object(setup_flow, "HERE", engines), \
+                    mock.patch.object(setup_flow, "build_engine") as build, \
+                    mock.patch.object(setup_flow, "_release_engine",
+                                      return_value={"source": "release v1.0.0"}) as release:
+                info = setup_flow.resolve_engine(family_by_id("qwen36"), None,
+                                                {"backend": "cuda", "missing": []}, TC_ALL,
+                                                out=lambda *a: None, engine_mode="prebuilt")
+        self.assertEqual(info["source"], "release v1.0.0")
+        release.assert_called_once()
+        build.assert_not_called()
+
 
 class Releases(HomeTestCase):
     def test_asset_names(self):
@@ -1806,6 +1860,74 @@ class WholeSetup(HomeTestCase):
         cfg = setup_flow.load_config()
         self.assertEqual((cfg["backend"], cfg["failed_builds"], cfg["gpu_pending"]),
                          ("cpu", ["cuda", "vulkan"], []))  # nothing to install: no rebuild on rerun
+
+    def test_engine_build_with_cuda_falls_back_when_the_build_fails(self):
+        """--engine build --backend cuda goes through the normal fallback chain:
+        a failed CUDA build falls back to Vulkan, as every other mode does."""
+        build, calls = self.failing_build("cuda")
+        with self.v100_machine(), mock.patch.object(setup_flow, "build_engine", side_effect=build):
+            code, text = self.run_setup(pick="tiny", engine="build", backend="cuda")
+        self.assertEqual(code, 0, text)
+        self.assertEqual(calls, ["cuda", "vulkan"])
+        self.assertEqual(setup_flow.load_config()["backend"], "vulkan")
+
+    def test_engine_build_resumes_the_backend_the_setup_asked_for(self):
+        """--engine build says where the engine comes from, not which backend it is
+        for: a rerun with it and no --backend keeps the backend the setup asked
+        for before, as the auto mode does."""
+        code, text = self.run_setup(pick="tiny", backend="cpu")
+        self.assertEqual(code, 0, text)
+        for engine in ("auto", "build"):
+            with self.subTest(engine=engine):
+                os.remove(os.path.join(self.engines, "qwen36"))   # so the rerun continues
+                seen = []
+                real = setup_flow.choose_backend
+
+                def rebuild(family, backend, tc, out=print, make_args=(), update=False):
+                    Path(self.engines, "qwen36").write_bytes(b"\x7fELF plain")
+                    return os.path.join(self.engines, "qwen36")
+
+                with mock.patch.object(setup_flow, "choose_backend",
+                                       side_effect=lambda *a, **k: seen.append(a[3]) or real(*a, **k)), \
+                     mock.patch.object(setup_flow, "build_engine", side_effect=rebuild):
+                    code, text = self.run_setup(engine=engine)
+                self.assertEqual(code, 0, text)
+                self.assertEqual(seen, ["cpu"])       # resumed, not re-derived as "auto"
+
+    def test_an_engine_mode_is_not_ignored_on_a_setup_that_is_done(self):
+        """--engine asks for another engine, so a setup that is already done must
+        not stop at "Already set up": it resolves the engine again (here: the
+        engine that is here is brought up to date from the sources)."""
+        code, text = self.run_setup(pick="tiny")
+        self.assertEqual(code, 0, text)
+        code, text = self.run_setup()
+        self.assertEqual(code, 0, text)
+        self.assertIn("Already set up", text)          # a plain rerun does nothing
+
+        def rebuild(family, backend, tc, out=print, make_args=(), update=False):
+            Path(self.engines, "qwen36").write_bytes(b"libvulkan.so.1")
+            return os.path.join(self.engines, "qwen36")
+
+        with mock.patch.object(setup_flow, "build_engine", side_effect=rebuild) as build:
+            code, text = self.run_setup(engine="build")
+        self.assertEqual(code, 0, text)
+        self.assertNotIn("Already set up", text)
+        self.assertIn("engine mode: build (the sources)", text)
+        build.assert_called_once()
+
+    def test_engine_prebuilt_takes_the_release_on_a_setup_that_is_done(self):
+        """--engine prebuilt on a setup that is already done: the release's
+        engine takes the place of the one that is here."""
+        code, text = self.run_setup(pick="tiny")
+        self.assertEqual(code, 0, text)
+        released = {"launcher_dir": self.engines, "engine": os.path.join(self.engines, "qwen36"),
+                    "backend": "vulkan", "source": "release v1.0.0"}
+        with mock.patch.object(setup_flow, "_release_engine", return_value=released) as release:
+            code, text = self.run_setup(engine="prebuilt")
+        self.assertEqual(code, 0, text)
+        self.assertNotIn("Already set up", text)
+        self.assertIn("engine mode: prebuilt (the release)", text)
+        release.assert_called_once()
 
     def test_a_failed_cpu_build_stops(self):
         os.remove(os.path.join(self.engines, "qwen36"))
